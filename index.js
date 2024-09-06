@@ -3,6 +3,7 @@ const cors = require("cors");
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const { totp } = require("otplib"); // Use otplib for MFA tokens
+const bcrypt = require('bcrypt');
 
 const app = express();
 const PORT = 3001;
@@ -13,7 +14,7 @@ const JWT_SECRET = "your_secret_key_here";
 // Configure CORS to allow requests from http://localhost:5173 and handle credentials
 app.use(
   cors({
-    origin: "http://localhost:5173", // Replace with your front-end origin
+    origin: "http://localhost:3000", // Replace with your front-end origin
     methods: ["GET", "POST", "PUT", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true, // Allow cookies and other credentials
@@ -38,11 +39,45 @@ const users = [
 const verificationCodes = {}; // Store verification codes for each email
 const mfaTokens = {}; // Store MFA tokens for each user
 const tokenExpiryStore = {}; // You might want to use a more persistent store in production
+const refreshTokens = {}; // Store refresh tokens for users
+// const Company = require('./models/Company');  // Adjust the path based on your folder structure
+const companies = [];  // In-memory array to store company data
 
 // Simulate sending an email (for mock purposes)
 const sendVerificationEmail = (email, code) => {
   console.log(`Sending verification code ${code} to ${email}`);
 };
+
+
+const nodemailer = require('nodemailer');
+
+const transporter = nodemailer.createTransport({
+  service: 'Gmail',
+  auth: {
+    user: 'your-email@gmail.com',
+    pass: 'your-email-password',
+  },
+});
+
+const sendRegisterVerificationEmail = async (to, link) => {
+  // const mailOptions = {
+  //   from: to,
+  //   to,
+  //   subject: 'Complete Your Registration',
+  //   html: `<p>Please complete your registration by clicking the link below:</p>
+  //          <a href="${link}">Complete Registration</a>`,
+  // };
+  console.log(`${to} Please complete your registration by clicking the link below: ${link}`);
+
+  // await transporter.sendMail(mailOptions);
+};
+
+const sendApprovalEmail = async (to) => {
+  console.log(`Approval email sent to ${to}`);
+}
+
+module.exports = { sendVerificationEmail };
+
 
 // Generate random verification code
 const generateVerificationCode = () => {
@@ -53,8 +88,6 @@ const generateVerificationCode = () => {
 const generateMfaToken = (secret) => {
   return totp.generate(secret);
 };
-
-// Mock API Endpoints
 
 // Login (Passwordless Start)
 app.post("/api/v2/login", (req, res) => {
@@ -180,6 +213,125 @@ app.post("/api/v2/refresh-token", (req, res) => {
     token,
   });
 });
+
+// API endpoint to register the company and send the email
+app.post('/api/v2/register', async (req, res) => {
+  const { companyName, companyEmail } = req.body;
+
+  try {
+     // Check if the email is already registered
+     const existingCompany = companies.find(company => company.email === companyEmail);
+     if (existingCompany) {
+       return res.status(400).json({ message: 'Company already registered' });
+     }
+ 
+     // Generate a verification token with JWT
+     const token = jwt.sign(
+      { companyEmail, companyName },
+      JWT_SECRET, // Use your secret key
+      { expiresIn: '1d' } // Token expires in 1 day
+    );
+    // Send verification email
+    const verificationLink = `http://localhost:3000/register/complete-registration?token=${token}`;
+    await sendRegisterVerificationEmail(companyEmail, verificationLink);
+    // Save company registration with a pending status
+    const newCompany = {
+      name: companyName,
+      email: companyEmail,
+      verificationToken: token,
+      status: 'pending',
+    };
+    companies.push(newCompany);
+
+    res.status(200).json({ message: 'Verification email sent successfully', success: true });
+  } catch (error) {
+    console.error('Error during registration:', error);
+
+    if (error.code === 'ECONNREFUSED') {
+      return res.status(500).json({ message: 'Failed to connect to email service' });
+    }
+
+    res.status(500).json({ message: 'Error registering company', error: error.message });
+  }
+});
+
+app.post('/api/v2/get-company-info', (req, res) => {
+  const { token } = req.body;
+
+  try {
+    // Verify and decode the JWT token
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const { companyEmail, companyName } = decoded;
+
+    // Return the company information
+    return res.status(200).json({
+      success: true,
+      companyEmail,
+      companyName,
+    });
+  } catch (error) {
+    return res.status(400).json({ success: false, error: 'Invalid or expired token.' });
+  }
+});
+
+
+
+// Complete the company registration
+app.post('/api/v2/complete-registration', async (req, res) => {
+  console.log("req.body", req.body);  
+  const {
+    companyName,
+    companyEmail,
+    companyWebsite,
+    businessRegNo,
+    country,
+    state,
+    city,
+    phone,
+    accountEmail,
+    accountPassword,
+  } = req.body;
+
+  try {
+    // Validate the presence of required fields
+    if (!companyName || !companyEmail || !accountPassword) {
+      return res.status(400).json({ message: 'Missing required fields' });
+    }
+
+    // Find the company by pending status in the in-memory companies array
+    // (You may need to adapt this part based on your actual logic to identify the company)
+    const company = companies.find(c => c.email === companyEmail && c.status === 'pending');
+    if (!company) {
+      return res.status(400).json({ message: 'Company not found or not in pending status' });
+    }
+
+    // Hash the password before storing it
+    const hashedPassword = await bcrypt.hash(accountPassword, 10);
+
+    // Update company details and mark it as approved
+    company.name = companyName;
+    company.email = companyEmail;
+    company.website = companyWebsite;
+    company.businessRegNo = businessRegNo;
+    company.country = country;
+    company.state = state;
+    company.city = city;
+    company.phone = phone;
+    company.accountEmail = accountEmail;
+    company.accountPassword = hashedPassword; // Store the hashed password
+    company.status = 'approved'; // Mark the company as approved
+
+    // Send approval email (or handle declined status if needed)
+    await sendApprovalEmail(companyEmail);
+
+    res.status(200).json({ message: 'Registration completed successfully', success: true });
+  } catch (error) {
+    console.error('Error completing registration:', error);
+    res.status(500).json({ message: 'Error completing registration', error: error.message });
+  }
+});
+
+
 
 app.listen(PORT, () => {
   console.log(`Mock Auth0 API running on http://localhost:${PORT}`);
